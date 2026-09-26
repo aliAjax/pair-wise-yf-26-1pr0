@@ -1,7 +1,102 @@
-<!doctype html><html lang="zh-CN"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>数字档案长期保存</title>
-<style>body{font:16px system-ui;max-width:980px;margin:32px auto;padding:0 16px}input,textarea,button,select{font:inherit;padding:8px;margin:4px}textarea{width:100%;height:110px}.panel{border:1px solid #bbb;padding:16px;border-radius:8px;margin:12px 0}pre{background:#f4f4f4;padding:12px;white-space:pre-wrap}</style></head>
-<body><h1>数字档案长期保存</h1><p>演示账号：owner、archivist、auditor、outsider。请求使用 <code>X-User-Id</code>。</p>
-<section class="panel"><select id="user"><option>owner</option><option>archivist</option><option>auditor</option><option>outsider</option></select>
-<button onclick="loadStatus()">查看档案状态</button><pre id="out"></pre></section>
-<p>详细接口见 README。页面用于完成初始化后的状态检查，核心流程由 JSON API 提供。</p>
-<script>const out=document.querySelector("#out"),user=document.querySelector("#user");async function loadStatus(){const id=prompt("档案 ID","1");const r=await fetch(`/api/archives/${id}/status`,{headers:{"X-User-Id":user.value}});out.textContent=JSON.stringify(await r.json(),null,2)}</script></body></html>
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>到期处置台 · 数字档案长期保存</title>
+<link rel="stylesheet" href="/static/style.css">
+</head>
+<body>
+<header class="topbar">
+  <h1>到期处置台</h1>
+  <div class="actor">
+    <label for="user">当前身份</label>
+    <select id="user">
+      <option value="archivist">archivist（档案管理员）</option>
+      <option value="owner">owner（档案所有者）</option>
+      <option value="auditor">auditor（独立审计员）</option>
+      <option value="outsider">outsider（未授权访客）</option>
+    </select>
+    <button id="refresh" class="btn">刷新</button>
+  </div>
+</header>
+
+<p class="hint">
+  管理员建立处置批次并纳入到期档案；审计员可对有争议档案做<b>保全冻结</b>。
+  批次执行前会再次核对保留期限与冻结状态，出现变化即退回「待确认」。处置后档案只读，版本、副本与审计记录仍可查看。
+</p>
+
+<section class="panel">
+  <div class="panel-head">
+    <h2>建立处置批次</h2>
+    <button id="load-candidates" class="btn btn-ghost">载入到期候选</button>
+  </div>
+  <div class="row">
+    <input id="batch-name" type="text" placeholder="批次名称，如 2026Q3 到期处置">
+    <button id="create-batch" class="btn btn-primary">建立批次并纳入</button>
+  </div>
+  <div id="candidates" class="candidate-list muted">点击「载入到期候选」查看已到期、尚未进入打开批次的档案。</div>
+</section>
+
+<section class="panel">
+  <div class="panel-head">
+    <h2>处置批次</h2>
+    <span id="last-checked" class="muted"></span>
+  </div>
+  <div id="batches" class="batch-list"></div>
+</section>
+
+<section class="panel">
+  <div class="panel-head"><h2>阻塞项</h2><span id="blocker-count" class="tag tag-pending"></span></div>
+  <div id="blockers"></div>
+</section>
+
+<section class="groups" id="groups">
+  <div class="group-col" data-group="pending">
+    <h3>待确认 <span class="tag tag-pending" data-count="pending"></span></h3>
+    <div class="group-body" data-body="pending"></div>
+  </div>
+  <div class="group-col" data-group="ready">
+    <h3>可处置 <span class="tag tag-ready" data-count="ready"></span></h3>
+    <div class="group-body" data-body="ready"></div>
+  </div>
+  <div class="group-col" data-group="frozen">
+    <h3>已冻结 <span class="tag tag-frozen" data-count="frozen"></span></h3>
+    <div class="group-body" data-body="frozen"></div>
+  </div>
+  <div class="group-col" data-group="disposed">
+    <h3>已处置 <span class="tag tag-disposed" data-count="disposed"></span></h3>
+    <div class="group-body" data-body="disposed"></div>
+  </div>
+</section>
+
+<div id="detail" class="drawer hidden">
+  <div class="drawer-head">
+    <h2 id="detail-title">批次详情</h2>
+    <button id="detail-close" class="btn btn-ghost">关闭</button>
+  </div>
+  <div id="detail-meta" class="muted"></div>
+  <div class="detail-actions">
+    <button id="btn-check" class="btn">执行前核对</button>
+    <button id="btn-confirm" class="btn">确认勾选项</button>
+    <button id="btn-add" class="btn btn-ghost">纳入候选档案</button>
+    <button id="btn-execute" class="btn btn-danger">执行处置</button>
+  </div>
+  <div id="detail-body"></div>
+</div>
+
+<div id="modal" class="modal hidden">
+  <div class="modal-box">
+    <h3 id="modal-title"></h3>
+    <div id="modal-body"></div>
+    <div class="modal-actions">
+      <button id="modal-cancel" class="btn btn-ghost">取消</button>
+      <button id="modal-ok" class="btn btn-primary">确定</button>
+    </div>
+  </div>
+</div>
+
+<div id="toast" class="toast hidden"></div>
+<script src="/static/app.js"></script>
+</body>
+</html>
