@@ -1,7 +1,238 @@
-<!doctype html><html lang="zh-CN"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>数字档案长期保存</title>
-<style>body{font:16px system-ui;max-width:980px;margin:32px auto;padding:0 16px}input,textarea,button,select{font:inherit;padding:8px;margin:4px}textarea{width:100%;height:110px}.panel{border:1px solid #bbb;padding:16px;border-radius:8px;margin:12px 0}pre{background:#f4f4f4;padding:12px;white-space:pre-wrap}</style></head>
-<body><h1>数字档案长期保存</h1><p>演示账号：owner、archivist、auditor、outsider。请求使用 <code>X-User-Id</code>。</p>
-<section class="panel"><select id="user"><option>owner</option><option>archivist</option><option>auditor</option><option>outsider</option></select>
-<button onclick="loadStatus()">查看档案状态</button><pre id="out"></pre></section>
-<p>详细接口见 README。页面用于完成初始化后的状态检查，核心流程由 JSON API 提供。</p>
-<script>const out=document.querySelector("#out"),user=document.querySelector("#user");async function loadStatus(){const id=prompt("档案 ID","1");const r=await fetch(`/api/archives/${id}/status`,{headers:{"X-User-Id":user.value}});out.textContent=JSON.stringify(await r.json(),null,2)}</script></body></html>
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>到期处置台 · 数字档案长期保存</title>
+<style>
+:root{--bd:#bbb;--mut:#666;--warn:#b45309;--danger:#b91c1c;--ok:#15803d;--blue:#1d4ed8}
+body{font:15px system-ui;max-width:1180px;margin:24px auto;padding:0 16px;color:#1a1a1a}
+h1{font-size:22px}h2{font-size:17px;margin:18px 0 8px}
+code{background:#f1f1f1;padding:1px 5px;border-radius:4px}
+.bar{display:flex;gap:10px;align-items:center;flex-wrap:wrap;background:#f7f7f8;border:1px solid var(--bd);border-radius:8px;padding:10px 14px}
+input,button,select,textarea{font:inherit;padding:6px 10px;border-radius:6px;border:1px solid var(--bd);background:#fff}
+button{cursor:pointer}button:hover{border-color:#666}
+button.primary{background:var(--blue);color:#fff;border-color:var(--blue)}
+button.danger{color:var(--danger)}
+button:disabled{opacity:.45;cursor:not-allowed}
+.panel{border:1px solid var(--bd);border-radius:8px;padding:14px;margin:12px 0}
+.muted{color:var(--mut);font-size:13px}
+table{border-collapse:collapse;width:100%;font-size:14px}
+th,td{border-bottom:1px solid #e3e3e3;padding:7px 8px;text-align:left;vertical-align:top}
+th{color:var(--mut);font-weight:600;background:#fafafa}
+.tag{display:inline-block;padding:1px 8px;border-radius:999px;font-size:12px;border:1px solid}
+.tag.pending{color:var(--warn);border-color:var(--warn)}
+.tag.ready{color:var(--ok);border-color:var(--ok)}
+.tag.frozen{color:var(--danger);border-color:var(--danger)}
+.tag.disposed{color:var(--mut);border-color:var(--mut)}
+.block{color:var(--danger);font-size:12.5px}
+.cols{display:grid;grid-template-columns:repeat(3,1fr);gap:12px}
+@media(max-width:900px){.cols{grid-template-columns:1fr}}
+.group{border:1px solid var(--bd);border-radius:8px;padding:10px}
+.group h3{margin:0 0 8px;font-size:15px;display:flex;justify-content:space-between}
+.group .item{border-top:1px dashed #ddd;padding:8px 0}
+.group .item:first-of-type{border-top:none}
+.row-actions{display:flex;gap:6px;margin-top:6px;flex-wrap:wrap}
+#msg{white-space:pre-wrap;font-family:ui-monospace,monospace;font-size:12.5px}
+.ok-text{color:var(--ok)}.err-text{color:var(--danger)}
+.right{margin-left:auto}
+</style>
+</head>
+<body>
+<h1>到期处置台</h1>
+<div class="bar">
+  <label>身份 <select id="user">
+    <option value="archivist">archivist 档案管理员</option>
+    <option value="owner">owner 档案负责人</option>
+    <option value="auditor">auditor 独立审计员</option>
+    <option value="outsider">outsider 未授权访客</option>
+  </select></label>
+  <button onclick="loadDue()">刷新到期清单</button>
+  <button onclick="loadBatches()">刷新批次</button>
+  <span class="muted right">所有请求带 <code>X-User-Id</code>；规则、数据、入口分模块维护</span>
+</div>
+
+<div class="panel">
+  <h2>① 到期档案（可纳入新处置批次）</h2>
+  <div id="due" class="muted">点击“刷新到期清单”加载。</div>
+  <div class="row-actions">
+    <input id="note" placeholder="批次说明（可选）" style="min-width:240px">
+    <button class="primary" id="mkBatch" onclick="createBatch()" disabled>建立处置批次（纳入勾选项）</button>
+  </div>
+</div>
+
+<div class="panel">
+  <h2>② 处置批次</h2>
+  <div id="batchList" class="muted">尚未加载。</div>
+</div>
+
+<div class="panel" id="deskPanel" hidden>
+  <h2>③ 处置台 <span id="deskTitle" class="muted"></span></h2>
+  <div class="bar" style="margin-bottom:10px">
+    <button class="primary" onclick="executeBatch()">开始执行批次（执行前再核对）</button>
+    <span class="muted">最近核对时间：<b id="lastChecked">—</b></span>
+    <span class="muted">批次状态：<b id="batchState">—</b></span>
+  </div>
+  <div class="cols">
+    <section class="group"><h3>待确认 <span id="c-pending" class="tag pending">0</span></h3><div id="g-pending"></div></section>
+    <section class="group"><h3>可处置 <span id="c-ready" class="tag ready">0</span></h3><div id="g-ready"></div></section>
+    <section class="group"><h3>已冻结 <span id="c-frozen" class="tag frozen">0</span></h3><div id="g-frozen"></div></section>
+  </div>
+  <h2>已处置 <span id="c-disposed" class="tag disposed">0</span></h2>
+  <div id="g-disposed"></div>
+  <h2>阻塞项</h2>
+  <div id="blockers" class="muted">无阻塞项。</div>
+</div>
+
+<div class="panel"><h2>操作结果</h2><div id="msg" class="muted">—</div></div>
+
+<script>
+const $ = s => document.querySelector(s);
+let dueList = [], currentBatch = null;
+
+async function api(path, opts = {}) {
+  const r = await fetch(path, Object.assign({headers: {"X-User-Id": $("#user").value}}, opts));
+  const data = await r.json().catch(() => ({}));
+  if (!r.ok) { const e = new Error(data?.error?.message || ("HTTP " + r.status)); e.payload = data; throw e; }
+  return data;
+}
+function esc(s){return String(s ?? "").replace(/[&<>]/g, c => ({"&":"&amp;","<":"&lt;",">":"&gt;"}[c]));}
+function say(text, ok = false){ $("#msg").className = ok ? "ok-text" : "err-text"; $("#msg").textContent = text; }
+function fmt(t){ return t ? new Date(t).toLocaleString("zh-CN", {hour12:false}) : "—"; }
+const STATUS_LABEL = {pending:"待确认", ready:"可处置", frozen:"已冻结", disposed:"已处置"};
+
+async function loadDue() {
+  try {
+    const d = await api("/api/disposition/due");
+    dueList = d.due;
+    if (!dueList.length) { $("#due").innerHTML = '<span class="muted">没有待纳入批次的到期档案（已处置或已在批次中的不重复出现）。</span>'; }
+    else {
+      $("#due").innerHTML = '<table><thead><tr><th></th><th>ID</th><th>档案</th><th>保留期限</th><th>逾期</th><th>版本</th><th>副本</th></tr></thead><tbody>'
+        + dueList.map(a => `<tr><td><input type="checkbox" class="pick" value="${a.id}"></td>
+          <td>${a.id}</td><td>${esc(a.name)}</td><td>${a.retention_until}</td>
+          <td>${a.days_overdue} 天</td><td>${a.version_count}</td><td>${a.copy_count}</td></tr>`).join("")
+        + "</tbody></table>";
+    }
+    $("#mkBatch").disabled = !dueList.length;
+    document.querySelectorAll(".pick").forEach(c => c.addEventListener("change",
+      () => $("#mkBatch").disabled = !document.querySelectorAll(".pick:checked").length));
+  } catch (e) { $("#due").innerHTML = `<span class="block">${esc(e.message)}</span>`; }
+}
+
+async function createBatch() {
+  const ids = [...document.querySelectorAll(".pick:checked")].map(c => Number(c.value));
+  if (!ids.length) return;
+  try {
+    const b = await api("/api/disposition/batches", {method:"POST", headers:{"Content-Type":"application/json","X-User-Id":$("#user").value},
+      body: JSON.stringify({note: $("#note").value, archive_ids: ids})});
+    say(`已建立批次 #${b.id}，纳入 ${b.counts.pending} 项，全部进入待确认。`, true);
+    await loadBatches(); openBatch(b.id);
+  } catch (e) { say(e.message); }
+}
+
+async function loadBatches() {
+  try {
+    const d = await api("/api/disposition/batches");
+    if (!d.batches.length) { $("#batchList").textContent = "暂无批次。"; return; }
+    $("#batchList").innerHTML = '<table><thead><tr><th>#</th><th>说明</th><th>待确认</th><th>可处置</th><th>已冻结</th><th>已处置</th><th>最近核对</th><th></th></tr></thead><tbody>'
+      + d.batches.map(b => `<tr><td>${b.id}</td><td>${esc(b.note||"")}</td>
+        <td>${b.counts.pending}</td><td>${b.counts.ready}</td><td>${b.counts.frozen}</td><td>${b.counts.disposed}</td>
+        <td>${fmt(b.last_checked_at)}</td><td><button onclick="openBatch(${b.id})">打开处置台</button></td></tr>`).join("")
+        + "</tbody></table>";
+  } catch (e) { $("#batchList").innerHTML = `<span class="block">${esc(e.message)}</span>`; }
+}
+
+async function openBatch(id) {
+  try {
+    currentBatch = await api(`/api/disposition/batches/${id}`);
+    $("#deskPanel").hidden = false;
+    $("#deskTitle").textContent = `批次 #${currentBatch.id} · ${currentBatch.note || "无说明"}`;
+    $("#lastChecked").textContent = fmt(currentBatch.last_checked_at);
+    $("#batchState").textContent = currentBatch.executed_at ? `已执行 ${fmt(currentBatch.executed_at)}` : "未执行";
+    renderGroups(currentBatch);
+  } catch (e) { say(e.message); }
+}
+
+function itemCard(it) {
+  return `<div class="item">
+    <div><b>#${it.id}</b> 档案 ${it.archive_id} · ${esc(it.archive_name)}</div>
+    <div class="muted">保留至 ${it.retention_until} ｜ 版本 ${it.version_count} ｜ 副本 ${it.copy_count} ｜ 最近核对 ${fmt(it.last_checked_at)}${it.last_checked_by ? "（"+esc(it.last_checked_by)+"）" : ""}</div>
+    ${it.blocker ? `<div class="block">⛔ ${esc(it.blocker.code)}：${esc(it.blocker.message)}</div>` : ""}
+    <div class="row-actions">
+      <button onclick="recheck(${it.id})">核对期限/冻结</button>
+      ${it.status === "frozen"
+        ? `<button onclick="release(${it.id})">解除冻结（审计员）</button>`
+        : `<button class="danger" onclick="freeze(${it.id})">保全冻结（审计员）</button>`}
+    </div></div>`;
+}
+
+function renderGroups(b) {
+  for (const k of ["pending","ready","frozen","disposed"]) {
+    $(`#c-${k}`).textContent = b.counts[k];
+    const box = $("#g-" + k);
+    if (k === "disposed") {
+      box.innerHTML = b.groups.disposed.length
+        ? '<table><thead><tr><th>处置项</th><th>档案</th><th>保留期限</th><th>版本/副本</th><th>处置时间</th><th>留痕</th></tr></thead><tbody>'
+          + b.groups.disposed.map(it => `<tr><td>#${it.id}</td><td>${esc(it.archive_name)}</td><td>${it.retention_until}</td>
+              <td>${it.version_count}/${it.copy_count}</td><td>${fmt(it.disposed_at)}</td>
+              <td><button onclick="showStatus(${it.archive_id})">查看版本/副本/审计</button></td></tr>`).join("") + "</tbody></table>"
+        : '<div class="muted">尚无已处置档案。</div>';
+    } else {
+      box.innerHTML = b.groups[k].map(itemCard).join("") || `<div class="muted">（空）</div>`;
+    }
+  }
+  $("#blockers").innerHTML = b.blockers.length
+    ? '<table><thead><tr><th>处置项</th><th>档案</th><th>阻塞原因</th></tr></thead><tbody>'
+      + b.blockers.map(x => `<tr><td>#${x.item_id}</td><td>${esc(x.archive_name)}</td>
+          <td class="block">${esc(x.blocker.code)}：${esc(x.blocker.message)}</td></tr>`).join("") + "</tbody></table>"
+    : "无阻塞项。";
+}
+
+async function recheck(id) {
+  try { const it = await api(`/api/disposition/items/${id}/recheck`, {method:"POST"});
+    say(`#${id} 核对完成 → ${STATUS_LABEL[it.status]}${it.blocker ? "（"+it.blocker.code+"）" : ""}`, !it.blocker);
+    await openBatch(currentBatch.id);
+  } catch (e) { say(e.message); }
+}
+async function freeze(id) {
+  const reason = prompt("保全冻结理由（争议说明）");
+  if (!reason) return;
+  try { await api(`/api/disposition/items/${id}/freeze`, {method:"POST", headers:{"Content-Type":"application/json","X-User-Id":$("#user").value}, body:JSON.stringify({reason})});
+    say(`#${id} 已保全冻结。`, true); await openBatch(currentBatch.id);
+  } catch (e) { say(e.message); }
+}
+async function release(id) {
+  const note = prompt("解除冻结说明") || "";
+  try { await api(`/api/disposition/items/${id}/release`, {method:"POST", headers:{"Content-Type":"application/json","X-User-Id":$("#user").value}, body:JSON.stringify({note})});
+    say(`#${id} 冻结已解除，退回待确认，需重新核对。`, true); await openBatch(currentBatch.id);
+  } catch (e) { say(e.message); }
+}
+async function executeBatch() {
+  if (!currentBatch) return;
+  if (!confirm("批次开始执行前会再次核对期限与冻结状态；有变化的项退回待确认，只有未变化的可处置项会执行。继续？")) return;
+  try {
+    const b = await api(`/api/disposition/batches/${currentBatch.id}/execute`, {method:"POST"});
+    say(`执行完成：处置档案 [${b.disposed_archive_ids.join(", ") || "无"}]，退回 ${b.returned_item_ids.length} 项。版本、副本与审计记录保留可查。`, true);
+    await loadBatches(); await openBatch(currentBatch.id);
+  } catch (e) {
+    if (e.payload?.batch) { currentBatch = e.payload.batch; renderGroups(currentBatch); $("#lastChecked").textContent = fmt(currentBatch.last_checked_at); }
+    say("执行被阻止：" + e.message + "（变化已退回待确认，请重新核对后再执行）");
+    await loadBatches();
+  }
+}
+async function showStatus(archiveId) {
+  try {
+    const d = await api(`/api/archives/${archiveId}/status`);
+    const lines = [
+      `档案：${d.archive.name}（状态 ${d.archive.state}，保留至 ${d.archive.retention_until}）`,
+      `版本：${d.versions.map(v => `v${v.version}[${v.state}] 文件${v.file_count}/副本${v.copy_count}`).join("，") || "无"}`,
+      "审计：",
+      ...d.audit.map(a => `  ${a.created_at} ${a.actor_id} ${a.action} ${JSON.stringify(a.detail)}`),
+    ];
+    alert(lines.join("\n"));
+  } catch (e) { say(e.message); }
+}
+loadDue(); loadBatches();
+</script>
+</body>
+</html>

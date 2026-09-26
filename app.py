@@ -8,7 +8,7 @@ import hashlib
 import json
 import sqlite3
 import threading
-from datetime import date, datetime, timezone
+from datetime import date, datetime, timedelta, timezone
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path, PurePosixPath
 from urllib.parse import urlparse
@@ -22,6 +22,13 @@ class BusinessError(Exception):
     def __init__(self, message: str, status: int = 400, code: str = "bad_request"):
         super().__init__(message)
         self.message, self.status, self.code = message, status, code
+
+
+class BatchBlockedError(BusinessError):
+    """执行前核对未通过：变化已提交，错误体携带退回后的批次状态。"""
+    def __init__(self, batch: dict):
+        super().__init__("没有可执行的处置项，存在阻塞项，相关项已退回待确认", 409, "batch_blocked")
+        self.batch = batch
 
 
 def now() -> str:
@@ -68,6 +75,14 @@ class PreservationStore:
         conn.execute("PRAGMA foreign_keys=ON")
         conn.execute("PRAGMA busy_timeout=10000")
         return conn
+
+    @property
+    def disposition(self):
+        """到期处置台数据层（延迟导入，避免规则/数据模块与入口模块循环导入）。"""
+        from disposition_repo import DispositionRepository
+        if not hasattr(self, "_disposition"):
+            self._disposition = DispositionRepository(self)
+        return self._disposition
 
     def init_schema(self) -> None:
         with self._lock, self.connect() as conn:
@@ -144,8 +159,48 @@ class PreservationStore:
                     detail TEXT NOT NULL,
                     created_at TEXT NOT NULL
                 );
+                CREATE TABLE IF NOT EXISTS disposition_batches(
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    created_by TEXT NOT NULL REFERENCES users(id),
+                    note TEXT NOT NULL DEFAULT '',
+                    state TEXT NOT NULL DEFAULT 'open' CHECK(state IN ('open','executed')),
+                    created_at TEXT NOT NULL,
+                    last_checked_at TEXT,
+                    executed_at TEXT
+                );
+                CREATE TABLE IF NOT EXISTS disposition_items(
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    batch_id INTEGER NOT NULL REFERENCES disposition_batches(id),
+                    archive_id INTEGER NOT NULL REFERENCES archives(id),
+                    status TEXT NOT NULL CHECK(status IN ('pending','ready','frozen','disposed')),
+                    retention_snapshot TEXT NOT NULL,
+                    blocker_code TEXT,
+                    blocker_message TEXT,
+                    created_by TEXT NOT NULL REFERENCES users(id),
+                    created_at TEXT NOT NULL,
+                    last_checked_at TEXT,
+                    last_checked_by TEXT,
+                    disposed_at TEXT
+                );
+                CREATE UNIQUE INDEX IF NOT EXISTS idx_items_active_archive
+                    ON disposition_items(archive_id) WHERE status IN ('pending','ready','frozen');
+                CREATE TABLE IF NOT EXISTS freezes(
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    item_id INTEGER NOT NULL REFERENCES disposition_items(id),
+                    active INTEGER NOT NULL DEFAULT 1 CHECK(active IN (0,1)),
+                    reason TEXT NOT NULL,
+                    created_by TEXT NOT NULL REFERENCES users(id),
+                    created_at TEXT NOT NULL,
+                    released_by TEXT REFERENCES users(id),
+                    released_at TEXT
+                );
+                CREATE UNIQUE INDEX IF NOT EXISTS idx_freezes_active_item ON freezes(item_id) WHERE active=1;
                 """
             )
+            # 处置执行后档案标记为 disposed，但版本、副本、审计记录全部保留可查
+            columns = {r[1] for r in conn.execute("PRAGMA table_info(archives)")}
+            if "state" not in columns:
+                conn.execute("ALTER TABLE archives ADD COLUMN state TEXT NOT NULL DEFAULT 'active'")
 
     def seed(self) -> None:
         self.init_schema()
@@ -159,6 +214,49 @@ class PreservationStore:
                     ("outsider", "未授权访客", "auditor"),
                 ],
             )
+            # 到期处置台演示数据：三个已过保留期限、带有版本与离线副本的档案
+            today = date.today()
+            demo = [
+                ("已到期-地籍测绘卷", 40, "地籍测绘到期档案，含两个离线副本"),
+                ("已到期-人事影像卷", 12, "人事影像扫描件到期，审计可能有争议"),
+                ("已到期-旧办公系统迁移卷", 3, "旧系统格式迁移后的到期档案"),
+            ]
+            for name, overdue_days, file_content in demo:
+                if conn.execute("SELECT 1 FROM archives WHERE name=?", (name,)).fetchone():
+                    continue
+                retention = (today - timedelta(days=overdue_days)).isoformat()
+                cur = conn.execute(
+                    "INSERT INTO archives(name,owner_id,retention_until,restricted,created_at) VALUES(?,?,?,?,?)",
+                    (name, "owner", retention, 1, now()),
+                )
+                archive_id = cur.lastrowid
+                conn.execute(
+                    "INSERT INTO archive_members(archive_id,user_id,permission) VALUES(?,'archivist','read')",
+                    (archive_id,),
+                )
+                conn.execute(
+                    "INSERT INTO archive_members(archive_id,user_id,permission) VALUES(?,'auditor','read')",
+                    (archive_id,),
+                )
+                content = file_content.encode()
+                digest, size = hashlib.sha256(content).hexdigest(), len(content)
+                ver = conn.execute(
+                    "INSERT INTO archive_versions(archive_id,version,created_by,created_at) VALUES(?,?,?,?)",
+                    (archive_id, 1, "archivist", now()),
+                ).lastrowid
+                conn.execute(
+                    "INSERT INTO archive_files(version_id,path,sha256,size,content) VALUES(?,?,?,?,?)",
+                    (ver, "records/主卷.txt", digest, size, content),
+                )
+                for location in ("offline-disk-a", "offline-disk-b"):
+                    copy_id = conn.execute(
+                        "INSERT INTO copies(version_id,location,created_at,last_verified_at) VALUES(?,?,?,?)",
+                        (ver, location, now(), now()),
+                    ).lastrowid
+                    conn.execute(
+                        "INSERT INTO copy_files(copy_id,path,sha256,size,content) VALUES(?,?,?,?,?)",
+                        (copy_id, "records/主卷.txt", digest, size, content),
+                    )
 
     def _user(self, conn, user_id: str | None, roles: set[str] | None = None) -> sqlite3.Row:
         if not user_id:
@@ -181,6 +279,12 @@ class PreservationStore:
         ).fetchone()
         if not row or (require_write and row["permission"] != "write"):
             raise BusinessError("没有该受限档案的访问权限", 403, "forbidden")
+
+    @staticmethod
+    def _guard_mutable(archive: sqlite3.Row) -> None:
+        """处置后只保留查看（版本、副本、审计），拒绝一切写入。"""
+        if archive["state"] == "disposed":
+            raise BusinessError("档案已处置，内容与权限不可再变更", 409, "archive_disposed")
 
     def _audit(self, conn, archive_id: int, actor: str, action: str, detail: dict) -> None:
         conn.execute(
@@ -222,6 +326,7 @@ class PreservationStore:
             archive = conn.execute("SELECT * FROM archives WHERE id=?", (archive_id,)).fetchone()
             if not archive:
                 raise BusinessError("档案不存在", 404, "not_found")
+            self._guard_mutable(archive)
             if archive["owner_id"] != actor_id:
                 raise BusinessError("只有档案所有者可以授权", 403, "forbidden")
             self._user(conn, user_id)
@@ -238,6 +343,7 @@ class PreservationStore:
         with self.connect() as conn:
             actor = self._user(conn, actor_id, {"owner", "archivist"})
             self._access(conn, archive_id, actor, require_write=True)
+            self._guard_mutable(conn.execute("SELECT state FROM archives WHERE id=?", (archive_id,)).fetchone())
             try:
                 conn.execute("BEGIN IMMEDIATE")
                 version_no = conn.execute(
@@ -273,6 +379,7 @@ class PreservationStore:
             if not version:
                 raise BusinessError("档案版本不存在", 404, "not_found")
             self._access(conn, version["archive_id"], actor, require_write=True)
+            self._guard_mutable(conn.execute("SELECT state FROM archives WHERE id=?", (version["archive_id"],)).fetchone())
             try:
                 conn.execute("BEGIN IMMEDIATE")
                 cur = conn.execute(
@@ -374,6 +481,7 @@ class PreservationStore:
                 raise BusinessError("副本不存在", 404, "not_found")
             version = conn.execute("SELECT * FROM archive_versions WHERE id=?", (copy["version_id"],)).fetchone()
             self._access(conn, version["archive_id"], user, require_write=True)
+            self._guard_mutable(conn.execute("SELECT state FROM archives WHERE id=?", (version["archive_id"],)).fetchone())
             row = conn.execute("SELECT content FROM copy_files WHERE copy_id=? AND path=?", (copy_id, path)).fetchone()
             if not row:
                 raise BusinessError("副本文件不存在", 404, "not_found")
@@ -395,6 +503,7 @@ class PreservationStore:
             ).fetchone()
             if not source:
                 raise BusinessError("源文件不存在", 404, "source_not_found")
+            self._guard_mutable(conn.execute("SELECT state FROM archives WHERE id=?", (source_version["archive_id"],)).fetchone())
             converted = verify_manifest([{"path": target_path, "content_b64": content_b64}])[0]
             try:
                 conn.execute("BEGIN IMMEDIATE")
@@ -512,13 +621,42 @@ class Handler(BaseHTTPRequestHandler):
         if len(parts) == 4 and parts[:2] == ["api", "copies"] and parts[3] == "simulate-corruption" and method == "POST":
             d = self._body()
             return self._send(200, store.simulate_corruption(user, int(parts[2]), d.get("path", "")))
+        # ---- 到期处置台：请求入口只负责解析与委派，规则见 disposition_rules，数据见 disposition_repo ----
+        if path == "/api/disposition/due" and method == "GET":
+            return self._send(200, {"due": store.disposition.list_due(user, date.today())})
+        if path == "/api/disposition/batches" and method == "POST":
+            d = self._body()
+            return self._send(201, store.disposition.create_batch(user, d.get("note", ""), d.get("archive_ids"), date.today()))
+        if path == "/api/disposition/batches" and method == "GET":
+            return self._send(200, {"batches": store.disposition.list_batches(user, date.today())})
+        if len(parts) == 4 and parts[:3] == ["api", "disposition", "batches"] and method == "GET":
+            return self._send(200, store.disposition.get_batch(user, int(parts[3]), date.today()))
+        if len(parts) == 5 and parts[:3] == ["api", "disposition", "batches"] and parts[4] == "execute" and method == "POST":
+            batch = store.disposition.execute_batch(user, int(parts[3]), date.today())
+            if not batch["disposed_archive_ids"]:
+                raise BatchBlockedError(batch)
+            return self._send(200, batch)
+        if len(parts) == 5 and parts[:3] == ["api", "disposition", "items"] and parts[3].isdigit() and method == "POST":
+            d = self._body()
+            item_id = int(parts[3])
+            if parts[4] == "recheck":
+                return self._send(200, store.disposition.recheck_item(user, item_id, date.today()))
+            if parts[4] == "freeze":
+                return self._send(200, store.disposition.set_freeze(user, item_id, d.get("reason", "")))
+            if parts[4] == "release":
+                return self._send(200, store.disposition.release_freeze(user, item_id, d.get("note", "")))
+            raise BusinessError("未知处置项操作", 404, "not_found")
         raise BusinessError("接口不存在", 404, "not_found")
 
     def _handle(self, method: str) -> None:
         try:
             self._dispatch(method)
         except BusinessError as exc:
-            self._send(exc.status, {"error": {"code": exc.code, "message": exc.message}})
+            payload = {"error": {"code": exc.code, "message": exc.message}}
+            batch = getattr(exc, "batch", None)  # 执行前核对未通过：携带退回后的批次状态
+            if batch is not None:
+                payload["batch"] = batch
+            self._send(exc.status, payload)
         except (ValueError, TypeError):
             self._send(400, {"error": {"code": "invalid_path", "message": "路径参数格式错误"}})
         except Exception as exc:
